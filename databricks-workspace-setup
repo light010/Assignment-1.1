@@ -1,1 +1,444 @@
+#!/bin/bash
 
+# Databricks Workspace Setup Script (One-time Global Setup)
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Check prerequisites
+check_prerequisites() {
+    echo ""
+    print_info "🔍 STEP 0: Checking Prerequisites"
+    print_info "Verifying required tools are installed on your system"
+    echo ""
+    
+    print_info "Checking Python 3.11..."
+    if ! command -v python3.11 &> /dev/null; then
+        print_error "Python 3.11 not found. Please install Python 3.11"
+        print_info "Python 3.11 is required for Databricks development"
+        print_info "Install with: brew install python@3.11"
+        exit 1
+    fi
+    print_success "Python 3.11 found: $(python3.11 --version)"
+    
+    print_info "Checking Git..."
+    if ! command -v git &> /dev/null; then
+        print_error "Git not found. Please install Git"
+        print_info "Git is required for version control of your Databricks projects"
+        print_info "Install with: brew install git"
+        exit 1
+    fi
+    print_success "Git found: $(git --version)"
+    
+    print_info "Checking Homebrew..."
+    if ! command -v brew &> /dev/null; then
+        print_error "Homebrew not found. Please install Homebrew: https://brew.sh"
+        print_info "Homebrew is needed to install the Databricks CLI"
+        exit 1
+    fi
+    print_success "Homebrew found: $(brew --version | head -1)"
+    
+    print_success "✅ All prerequisites are met"
+}
+
+# Install/Update Databricks CLI using Homebrew
+install_databricks_cli() {
+    echo ""
+    print_info "📦 STEP 1: Installing/Updating Databricks CLI"
+    print_info "The Databricks CLI is required to manage workspaces and deploy bundles"
+    echo ""
+    
+    print_info "Checking Homebrew availability..."
+    if ! command -v brew &> /dev/null; then
+        print_error "Homebrew not found. Please install Homebrew first: https://brew.sh"
+        print_info "Homebrew is needed to install the Databricks CLI easily"
+        exit 1
+    fi
+    print_success "Homebrew found"
+    
+    print_info "Checking Databricks CLI installation..."
+    if command -v databricks &> /dev/null; then
+        current_version=$(databricks version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        print_info "Current version: $current_version"
+        
+        print_info "Checking for updates (this ensures you have the latest features)..."
+        brew upgrade databricks || print_info "No updates available"
+        
+        new_version=$(databricks version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [ "$current_version" != "$new_version" ]; then
+            print_success "Updated from $current_version to $new_version"
+        else
+            print_success "Already up to date: $current_version"
+        fi
+    else
+        print_info "Installing Databricks CLI via Homebrew..."
+        print_info "This will download and install the official Databricks CLI"
+        brew install databricks
+        print_success "Databricks CLI installed successfully"
+    fi
+    
+    print_info "Final version: $(databricks version)"
+    print_success "✅ Databricks CLI is ready"
+}
+
+# Show existing profiles with details
+show_existing_profiles() {
+    if [ ! -f ~/.databrickscfg ]; then
+        print_info "No existing profiles found"
+        return 0
+    fi
+    
+    profiles=$(grep "\[" ~/.databrickscfg | tr -d '[]' | grep -v DEFAULT)
+    
+    if [ -z "$profiles" ]; then
+        print_info "No existing profiles found"
+        return 0
+    fi
+    
+    echo "========================================"
+    echo "           EXISTING PROFILES"
+    echo "========================================"
+    
+    # Group profiles by environment
+    for env in dit fit iat; do
+        env_profiles=$(echo "$profiles" | grep "^$env")
+        if [ -n "$env_profiles" ]; then
+            echo ""
+            print_info "Environment: $env"
+            
+            # Use a different approach to avoid subshell issues
+            IFS=$'\n'
+            for profile in $env_profiles; do
+                if [ -n "$profile" ]; then
+                    workspace_desc=$(echo "$profile" | cut -d'-' -f2-)
+                    echo "  • $workspace_desc ($profile)"
+                    
+                    # Get workspace URL
+                    host=$(grep -A 10 "\[$profile\]" ~/.databrickscfg | grep "^host" | head -1 | cut -d'=' -f2 | tr -d ' ')
+                    if [ -n "$host" ]; then
+                        echo "    URL: $host"
+                    fi
+                    
+                    # Test connection status
+                    test_output=$(databricks auth env --profile "$profile" 2>&1)
+                    if echo "$test_output" | grep -q "DATABRICKS_HOST"; then
+                        echo -e "    Status: ${GREEN}✓ Configured${NC}"
+                    else
+                        echo -e "    Status: ${RED}✗ Not configured${NC}"
+                    fi
+                fi
+            done
+            unset IFS
+        fi
+    done
+    
+    echo ""
+    echo "========================================"
+    echo "DEBUG: Finished showing profiles" >&2
+}
+
+# Configure single workspace
+configure_single_workspace() {
+    echo ""
+    echo "📝 Setting up a new workspace profile..."
+    echo "Available environments: dit, fit, iat"
+    print_info "You can have multiple workspaces per environment"
+    
+    read -p "Environment (dit/fit/iat): " env_name
+    if [ -z "$env_name" ]; then
+        print_error "Environment name cannot be empty"
+        return 1
+    fi
+    
+    # Validate environment name
+    if [[ ! "$env_name" =~ ^(dit|fit|iat)$ ]]; then
+        print_error "Environment must be one of: dit, fit, iat"
+        return 1
+    fi
+    
+    read -p "Workspace description (e.g., share1-us-east, share1, tech-ingestion): " workspace_desc
+    if [ -z "$workspace_desc" ]; then
+        workspace_desc="main"
+    fi
+    
+    # Create profile name as environment-description
+    profile_name="${env_name}-${workspace_desc}"
+    
+    print_info "Creating profile: $profile_name"
+    read -p "Databricks workspace URL: " workspace_url
+    
+    if [ -z "$workspace_url" ]; then
+        print_error "Workspace URL cannot be empty"
+        return 1
+    fi
+    
+    echo ""
+    print_info "🔐 Choose Authentication Method:"
+    echo "1) OAuth U2M (Recommended - secure browser-based login)"
+    echo "2) Personal Access Token (PAT - for programmatic access)"
+    echo "3) Service Principal (for CI/CD automation)"
+    echo ""
+    print_info "OAuth is recommended for interactive development"
+    
+    read -p "Select method [1]: " auth_method
+    auth_method=${auth_method:-1}
+    
+    case $auth_method in
+        1)
+            print_info "🌐 Configuring OAuth for $env_name..."
+            print_info "Your browser will open for secure authentication"
+            print_info "Please complete the login process in your browser"
+            databricks auth login --host "$workspace_url" --profile "$profile_name"
+            print_success "OAuth authentication completed for $profile_name"
+            ;;
+        2)
+            print_info "🔑 Configuring PAT for $env_name..."
+            print_info "You can generate a PAT in Databricks: User Settings > Access Tokens"
+            read -s -p "Enter Personal Access Token: " token
+            echo ""
+            databricks configure --host "$workspace_url" --token "$token" --profile "$profile_name"
+            print_success "PAT authentication configured for $profile_name"
+            ;;
+        3)
+            print_info "🤖 Configuring Service Principal for $env_name..."
+            print_info "Service Principals are used for automated deployments"
+            read -p "Client ID: " client_id
+            read -s -p "Client Secret: " client_secret
+            echo ""
+            databricks configure --host "$workspace_url" --client-id "$client_id" --client-secret "$client_secret" --profile "$profile_name"
+            print_success "Service Principal configured for $profile_name"
+            ;;
+        *)
+            print_error "Invalid selection"
+            return 1
+            ;;
+    esac
+    
+    print_success "✅ $profile_name workspace profile configured successfully"
+    print_info "You can now use: databricks --profile $profile_name <command>"
+}
+
+# Configure multiple workspace profiles
+configure_workspaces() {
+    echo ""
+    print_info "🏢 STEP 2: Configuring Databricks Workspace Profiles"
+    print_info "Profiles allow you to connect to different Databricks workspaces (dit, fit, iat)"
+    print_info "Each profile stores authentication and workspace URL for easy switching"
+    echo ""
+    
+    # Show existing profiles first
+    show_existing_profiles
+    echo "DEBUG: After show_existing_profiles" >&2
+    
+    echo ""
+    print_info "💡 What happens next:"
+    echo "DEBUG: After what happens next" >&2
+    print_info "• You can create multiple workspaces per environment (dit, fit, iat)"
+    print_info "• Each workspace gets a descriptive name (e.g., dit-share1-us-east, dit-share1, dit-tech-ingestion)"
+    print_info "• Each profile stores workspace URL and authentication"
+    print_info "• OAuth authentication will open your browser for secure login"
+    echo ""
+    
+    read -p "Add new workspace profile? (y/n) [y]: " add_workspace
+    add_workspace=${add_workspace:-y}
+    
+    while [[ "$add_workspace" =~ ^[Yy]$ ]]; do
+        configure_single_workspace
+        echo ""
+        read -p "Add another workspace? (y/n) [n]: " add_workspace
+        add_workspace=${add_workspace:-n}
+    done
+    
+    print_success "✅ Workspace configuration complete"
+    print_info "Your profiles are saved in ~/.databrickscfg"
+}
+
+# Test connections for all profiles
+test_connections() {
+    echo ""
+    print_info "🔍 STEP 3: Testing Workspace Connections"
+    print_info "Verifying that each profile can successfully connect to its workspace"
+    echo ""
+    
+    if [ ! -f ~/.databrickscfg ]; then
+        print_info "No configuration found - skipping connection test"
+        return 0
+    fi
+    
+    # Get all profile names
+    profiles=$(grep "\[" ~/.databrickscfg | tr -d '[]')
+    
+    if [ -z "$profiles" ]; then
+        print_info "No profiles configured - skipping connection test"
+        return 0
+    fi
+    
+    print_info "Testing each profile by making an API call to verify authentication..."
+    echo ""
+    
+    for profile in $profiles; do
+        if [ "$profile" != "DEFAULT" ]; then
+            print_info "🔄 Testing $profile connection..."
+            
+            # Test with a simple API call
+            if databricks current-user me --profile "$profile" > /dev/null 2>&1; then
+                print_success "✅ $profile: Connection successful - authentication is working"
+            else
+                print_error "❌ $profile: Connection failed"
+                print_info "   → Profile is configured but authentication may have expired"
+                print_info "   → This is common with OAuth tokens that expire periodically"
+                print_info "   → Fix with: databricks auth login --host <workspace-url> --profile $profile"
+            fi
+        fi
+    done
+    
+    echo ""
+    print_info "💡 Connection Test Results Explained:"
+    print_info "• ✅ Success = Profile can authenticate and make API calls"
+    print_info "• ❌ Failed = Authentication expired or network issues"
+    echo ""
+    print_info "🔧 Troubleshooting Failed Connections:"
+    print_info "• OAuth tokens expire periodically (this is normal)"
+    print_info "• Re-authenticate: databricks auth login --host <workspace-url> --profile <profile-name>"
+    print_info "• Check config: databricks auth env --profile <profile-name>"
+    print_info "• Verify workspace URL is correct in your profile"
+}
+
+# Install VS Code extensions (if VS Code is available)
+install_vscode_extensions() {
+    echo ""
+    print_info "🔌 STEP 4: Installing VS Code Extensions"
+    print_info "These extensions provide Databricks integration, Python support, and Jupyter notebooks"
+    echo ""
+    
+    if command -v code &> /dev/null; then
+        print_info "VS Code found - installing essential extensions..."
+        echo ""
+        
+        print_info "📦 Installing Databricks extension (provides workspace sync, debugging, etc.)"
+        code --install-extension databricks.databricks --force 2>/dev/null || print_info "Databricks extension already installed"
+        
+        print_info "🐍 Installing Python extension (language support, IntelliSense, debugging)"
+        code --install-extension ms-python.python --force 2>/dev/null || print_info "Python extension already installed"
+        
+        print_info "📓 Installing Jupyter extension (notebook support)"
+        code --install-extension ms-toolsai.jupyter --force 2>/dev/null || print_info "Jupyter extension already installed"
+        
+        print_success "✅ VS Code extensions installed successfully"
+        echo ""
+        print_info "💡 What these extensions provide:"
+        print_info "• Databricks: Workspace sync, bundle deployment, cluster connection"
+        print_info "• Python: Code completion, debugging, linting for Python development"
+        print_info "• Jupyter: Run notebooks directly in VS Code with Databricks Connect"
+    else
+        print_info "VS Code not found on this system"
+        print_info "Extensions will be recommended when you create projects"
+        print_info "Install VS Code from: https://code.visualstudio.com/"
+    fi
+}
+
+# Create global configuration
+create_global_config() {
+    echo ""
+    print_info "⚙️  STEP 5: Creating Global Configuration"
+    print_info "Setting up global settings and templates for all Databricks projects"
+    echo ""
+    
+    print_info "Creating ~/.databricks directory for global settings..."
+    mkdir -p ~/.databricks
+    
+    print_info "Creating global .gitignore template for Databricks projects..."
+    cat > ~/.databricks/global.gitignore << 'EOF'
+# Databricks
+.databricks/
+*.dbc
+.databrickscfg
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+EOF
+    
+    print_success "✅ Global configuration created"
+    print_info "📁 Configuration files created:"
+    print_info "• ~/.databrickscfg - Workspace profiles and authentication"
+    print_info "• ~/.databricks/global.gitignore - Template for project .gitignore files"
+}
+
+# Main execution
+main() {
+    echo "========================================"
+    echo "  Databricks Workspace Setup (Global)"
+    echo "========================================"
+    echo ""
+    print_info "🎯 Purpose: One-time setup for your laptop"
+    print_info "This script will configure your system for Databricks development"
+    echo ""
+    print_info "📋 What this script does:"
+    print_info "1. ✅ Check prerequisites (Python 3.11, Git, Homebrew)"
+    print_info "2. 📦 Install/update Databricks CLI"
+    print_info "3. 🏢 Configure workspace profiles (dit, fit, iat)"
+    print_info "4. 🔍 Test connections to verify authentication"
+    print_info "5. 🔌 Install VS Code extensions"
+    print_info "6. ⚙️  Create global configuration"
+    echo ""
+    print_info "⏱️  This will take 5-10 minutes depending on your internet connection"
+    print_info "🔄 After completion, use databricks-bundle-setup.sh for each project"
+    echo ""
+    read -p "Press Enter to continue or Ctrl+C to cancel..."
+    
+    check_prerequisites
+    install_databricks_cli
+    configure_workspaces
+    test_connections || true  # Don't fail if connections fail
+    install_vscode_extensions
+    create_global_config
+    
+    echo ""
+    echo "========================================"
+    print_success "🎉 GLOBAL WORKSPACE SETUP COMPLETE!"
+    echo "========================================"
+    echo ""
+    print_info "📋 What was accomplished:"
+    print_info "✅ Databricks CLI installed and updated"
+    print_info "✅ Workspace profiles configured (saved in ~/.databrickscfg)"
+    print_info "✅ VS Code extensions installed for Databricks development"
+    print_info "✅ Global configuration created"
+    echo ""
+    print_info "🚀 Next Steps:"
+    print_info "1. Create a new project: ./databricks-bundle-setup.sh"
+    print_info "2. Your authentication is now configured globally"
+    print_info "3. All future projects will use these workspace profiles"
+    echo ""
+    print_info "📁 Important Files Created:"
+    print_info "• ~/.databrickscfg - Your workspace profiles and authentication"
+    print_info "• ~/.databricks/ - Global configuration directory"
+    echo ""
+    print_info "🔧 Useful Commands:"
+    print_info "• Check profiles: databricks auth env --profile <dit|fit|iat>"
+    print_info "• Re-authenticate: databricks auth login --host <url> --profile <name>"
+    print_info "• Check group membership: databricks current-user me --profile <dit|fit|iat> --output json"
+    print_info "• List workspace files: databricks workspace list / --profile <name>"
+    echo ""
+    print_success "Your system is now ready for Databricks development! 🚀"
+}
+
+main "$@"
