@@ -1,2258 +1,312 @@
-    # Create example Python notebook (.py format)
-    mkdir -p notebooks
-    cat > notebooks/example_analysis.py << 'EOF'
-# Databricks notebook source
-# MAGIC %md
-# MAGIC # Example Data Analysis with Unity Catalog
-# MAGIC This notebook demonstrates working with Unity Catalog volumes and tables in Databricks on AWS
-# MAGIC 
-# MAGIC **Features demonstrated:**
-# MAGIC - Unity Catalog volumes for file storage
-# MAGIC - Managed tables with governance
-# MAGIC - Databricks Connect compatibility
-# MAGIC - Notebook magics and globals
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Setup and Configuration
-
-# COMMAND ----------
-
-import sys
-sys.path.append("../src")
-
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from data_processing import get_spark_session
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-# The 'spark' global is automatically available in notebooks
-# It's preconfigured with Databricks Connect when running in VS Code
-print(f"Spark version: {spark.version}")
-print(f"Spark application: {spark.sparkContext.appName}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Working with Unity Catalog Volumes
-# MAGIC 
-# MAGIC Unity Catalog volumes provide governed access to non-tabular data
-
-# COMMAND ----------
-
-# Set up catalog and schema (adjust to your environment)
-CATALOG = "main"  # or your custom catalog
-SCHEMA = "default"  # or your schema
-VOLUME = "my_volume"  # your volume name
-
-# Display available catalogs using SQL magic
-# MAGIC %sql
-# MAGIC SHOW CATALOGS
-
-# COMMAND ----------
-
-# Show schemas in catalog
-spark.sql(f"USE CATALOG {CATALOG}")
-display(spark.sql("SHOW SCHEMAS"))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Using Notebook Magics
-
-# COMMAND ----------
-
-# MAGIC %fs ls /Volumes/
-
-# COMMAND ----------
-
-# MAGIC %sh
-# MAGIC # This runs on the local machine (not the cluster)
-# MAGIC echo "Running from: $(pwd)"
-# MAGIC echo "Python version: $(python --version)"
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Upload Files to Volume using dbutils
-
-# COMMAND ----------
-
-# Create sample data
-sample_data = spark.createDataFrame([
-    ("Product A", "Electronics", 100, "2024-01-01"),
-    ("Product B", "Electronics", 150, "2024-01-02"),
-    ("Product C", "Clothing", 50, "2024-01-01"),
-    ("Product D", "Clothing", 75, "2024-01-02"),
-    ("Product E", "Food", 25, "2024-01-01"),
-], ["product", "category", "value", "date"])
-
-# Save to volume as CSV
-volume_path = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/sample_data.csv"
-sample_data.write.mode("overwrite").option("header", "true").csv(volume_path)
-
-print(f"Data written to: {volume_path}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## List Files in Volume using %fs magic
-
-# COMMAND ----------
-
-# MAGIC %fs ls /Volumes/main/default/my_volume/
-
-# COMMAND ----------
-
-# Alternative using dbutils (global available in notebooks)
-files = dbutils.fs.ls(f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/")
-for file in files:
-    print(f"{file.name} - {file.size} bytes - {file.modificationTime}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Read Data and Create Managed Table
-
-# COMMAND ----------
-
-# Read CSV from volume
-df = spark.read.option("header", "true").csv(volume_path)
-df = df.withColumn("value", col("value").cast("int"))
-df = df.withColumn("date", col("date").cast("date"))
-
-# Display using the display() global function    # Create helper script for Unity Catalog operations
-    cat > unity-catalog-setup.sh << 'EOF'
 #!/bin/bash
-# Set up Unity Catalog resources for the bundle
-
-set -e
-
-# Get the target from command line or use dev as default
-TARGET=${1:-dev}
-
-echo "Setting up Unity Catalog resources for target: $TARGET"
-
-# Read variables from bundle config
-CATALOG=$(databricks bundle validate -t $TARGET --output json | jq -r '.variables.catalog.default // "main"')
-SCHEMA=$(databricks bundle validate -t $TARGET --output json | jq -r '.variables.schema.default // "default"')
-VOLUME=$(databricks bundle validate -t $TARGET --output json | jq -r '.variables.volume.default // "bundle_files"')
-
-echo "Using Catalog: $CATALOG"
-echo "Using Schema: $SCHEMA" 
-echo "Using Volume: $VOLUME"
-
-# Create catalog if needed (requires appropriate permissions)
-echo "Ensuring catalog exists..."
-databricks sql execute "CREATE CATALOG IF NOT EXISTS $CATALOG" || echo "Catalog already exists or insufficient permissions"
-
-# Create schema
-echo "Creating schema..."
-databricks sql execute "CREATE SCHEMA IF NOT EXISTS $CATALOG.$SCHEMA" || echo "Schema already exists or insufficient permissions"
-
-# Create volume for file storage
-echo "Creating volume..."
-databricks sql execute "CREATE VOLUME IF NOT EXISTS $CATALOG.$SCHEMA.$VOLUME" || echo "Volume already exists or insufficient permissions"
-
-echo "Unity Catalog setup complete!"
-echo ""
-echo "Volume path for file operations: /Volumes/$CATALOG/$SCHEMA/$VOLUME/"
-echo ""
-echo "Example usage:"
-echo "  Upload: dbutils.fs.cp('file:/local/file.csv', '/Volumes/$CATALOG/$SCHEMA/$VOLUME/file.csv')"
-echo "  List: dbutils.fs.ls('/Volumes/$CATALOG/$SCHEMA/$VOLUME/')"
-EOF
-    
-    chmod +x unity-catalog-setup.sh
-    
-    # Create file upload helper script
-    cat > upload-to-volume.py << 'EOF'
-#!/usr/bin/env python3
-"""Upload files to Unity Catalog volume."""
-
-import os
-import sys
-import argparse
-import requests
-from pathlib import Path
-
-
-def get_databricks_config():
-    """Get Databricks configuration from environment or CLI."""
-    # Try to get from databricks CLI config
-    try:
-        import subprocess
-        import json
-        
-        result = subprocess.run(
-            ["databricks", "auth", "env"],
-            capture_output=True,
-            text=True
-        )
-        
-        if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
-            config = {}
-            for line in lines:
-                if 'Host:' in line:
-                    config['host'] = line.split('Host:')[1].strip()
-                elif 'Token:' in line:
-                    config['token'] = line.split('Token:')[1].strip()
-            return config
-    except:
-        pass
-    
-    # Fall back to environment variables
-    return {
-        'host': os.environ.get('DATABRICKS_HOST'),
-        'token': os.environ.get('DATABRICKS_TOKEN')
-    }
-
-
-def upload_file_to_volume(local_path, catalog, schema, volume, remote_name=None):
-    """Upload a file to Unity Catalog volume using REST API."""
-    config = get_databricks_config()
-    
-    if not config.get('host') or not config.get('token'):
-        print("Error: Databricks authentication not configured")
-        print("Run 'databricks configure' or set DATABRICKS_HOST and DATABRICKS_TOKEN")
-        sys.exit(1)
-    
-    if remote_name is None:
-        remote_name = Path(local_path).name
-    
-    volume_path = f"/Volumes/{catalog}/{schema}/{volume}/{remote_name}"
-    url = f"{config['host']}/api/2.0/fs/files{volume_path}"
-    
-    headers = {
-        "Authorization": f"Bearer {config['token']}"
-    }
-    
-    print(f"Uploading {local_path} to {volume_path}...")
-    
-    with open(local_path, 'rb') as f:
-        params = {"overwrite": "true"}
-        response = requests.put(url, headers=headers, params=params, data=f)
-    
-    if response.status_code == 200:
-        print(f"Successfully uploaded to {volume_path}")
-    else:
-        print(f"Error uploading file: {response.status_code}")
-        print(response.text)
-        sys.exit(1)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Upload files to Unity Catalog volume")
-    parser.add_argument("file", help="Local file to upload")
-    parser.add_argument("--catalog", default="main", help="Unity Catalog name (default: main)")
-    parser.add_argument("--schema", default="default", help="Schema name (default: default)")
-    parser.add_argument("--volume", default="bundle_files", help="Volume name (default: bundle_files)")
-    parser.add_argument("--name", help="Remote file name (default: same as local)")
-    
-    args = parser.parse_args()
-    
-    if not os.path.exists(args.file):
-        print(f"Error: File not found: {args.file}")
-        sys.exit(1)
-    
-    upload_file_to_volume(
-        args.file,
-        args.catalog,
-        args.schema,
-        args.volume,
-        args.name
-    )
-
-
-if __name__ == "__main__":
-    main()
-EOF
-    
-    chmod +x upload-to-volume.py
-    
-    print_success "Unity Catalog helper scripts created!"
-}#!/bin/bash
 
 # Databricks Asset Bundle Setup Script
-# This script creates a complete Databricks project with Asset Bundle capabilities
-# Features:
-# - Interactive setup with defaults
-# - Bidirectional sync between VS Code and Databricks
-# - Best practices implementation
-# - Easy single-command setup
+set -e
 
-set -e  # Exit on error
-
-# Color codes for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Function to print colored output
-print_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+print_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+print_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
+print_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
-print_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
-}
-
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
-
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-# Function to check if a command exists
-command_exists() {
-    command -v "$1" &> /dev/null
-}
-
-# Function to read input with default value
-read_with_default() {
-    local prompt="$1"
-    local default="$2"
-    local value
-    
-    read -p "$prompt [$default]: " value
-    echo "${value:-$default}"
-}
-
-# Function to validate URL
-validate_url() {
-    if [[ $1 =~ ^https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/.*)?$ ]]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Check prerequisites
+# Check prerequisites and select profile
 check_prerequisites() {
     print_info "Checking prerequisites..."
     
-    local missing_deps=()
-    
-    # Check for required commands
-    if ! command_exists "databricks"; then
-        missing_deps+=("databricks-cli")
-    fi
-    
-    if ! command_exists "python3"; then
-        missing_deps+=("python3")
-    fi
-    
-    if ! command_exists "pip3"; then
-        missing_deps+=("pip3")
-    fi
-    
-    if ! command_exists "git"; then
-        missing_deps+=("git")
-    fi
-    
-    if [ ${#missing_deps[@]} -ne 0 ]; then
-        print_error "Missing required dependencies: ${missing_deps[*]}"
-        print_info "Please install the missing dependencies and run the script again."
-        
-        # Provide installation instructions
-        echo ""
-        print_info "Installation instructions:"
-        if [[ " ${missing_deps[@]} " =~ " databricks-cli " ]]; then
-            echo "  - Databricks CLI: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh"
-        fi
-        if [[ " ${missing_deps[@]} " =~ " python3 " ]] || [[ " ${missing_deps[@]} " =~ " pip3 " ]]; then
-            echo "  - Python3 & pip3: Visit https://www.python.org/downloads/"
-        fi
-        if [[ " ${missing_deps[@]} " =~ " git " ]]; then
-            echo "  - Git: Visit https://git-scm.com/downloads"
-        fi
+    if ! command -v databricks &> /dev/null; then
+        print_error "Databricks CLI not found. Run 'databricks-workspace-setup.sh' first"
         exit 1
     fi
     
-    # Check Databricks CLI version
-    local cli_version=$(databricks version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    if [ -n "$cli_version" ]; then
-        print_success "Databricks CLI version: $cli_version"
+    if ! command -v python3.11 &> /dev/null; then
+        print_error "Python 3.11 not found"
+        exit 1
     fi
     
-    print_success "All prerequisites are met!"
-}
-
-# Configure Databricks authentication
-configure_auth() {
-    print_info "Configuring Databricks authentication..."
-    
-    # Check if already configured
-    if databricks auth env 2>/dev/null | grep -q "Host:"; then
-        local use_existing
-        read -p "Databricks authentication already configured. Use existing configuration? (y/n) [y]: " use_existing
-        use_existing=${use_existing:-y}
-        
-        if [[ "$use_existing" =~ ^[Yy]$ ]]; then
-            print_success "Using existing Databricks configuration"
-            return 0
-        fi
-    fi
-    
-    # Get workspace URL
-    local workspace_url
-    while true; do
-        workspace_url=$(read_with_default "Enter your Databricks workspace URL (e.g., https://dbc-12345678-9abc.cloud.databricks.com)" "")
-        if validate_url "$workspace_url"; then
-            break
+    # Check for profiles and let user select
+    if [ -f ~/.databrickscfg ]; then
+        print_info "Available workspace profiles:"
+        profiles=$(grep "\[" ~/.databrickscfg | tr -d '[]' | grep -v DEFAULT)
+        if [ -n "$profiles" ]; then
+            # Group and display profiles by environment
+            echo ""
+            for env in dit fit iat; do
+                env_profiles=$(echo "$profiles" | grep "^$env")
+                if [ -n "$env_profiles" ]; then
+                    echo "$env Environment:"
+                    echo "$env_profiles" | nl -w2 -s') ' | sed 's/^/  /'
+                    echo ""
+                fi
+            done
+            
+            echo "All profiles:"
+            echo "$profiles" | nl -w2 -s') '
+            echo ""
+            read -p "Select profile number for this project [1]: " profile_num
+            profile_num=${profile_num:-1}
+            
+            selected_profile=$(echo "$profiles" | sed -n "${profile_num}p")
+            if [ -n "$selected_profile" ]; then
+                export DATABRICKS_CONFIG_PROFILE="$selected_profile"
+                print_success "Using profile: $selected_profile"
+                
+                # Extract environment from profile name
+                env_name=$(echo "$selected_profile" | cut -d'-' -f1)
+                workspace_desc=$(echo "$selected_profile" | cut -d'-' -f2-)
+                print_info "Environment: $env_name, Workspace: $workspace_desc"
+            else
+                print_error "Invalid profile selection"
+                exit 1
+            fi
         else
-            print_error "Invalid URL format. Please enter a valid HTTPS URL."
+            print_error "No profiles found. Run 'databricks-workspace-setup.sh' first"
+            exit 1
         fi
-    done
-    
-    # Choose authentication method
-    echo ""
-    print_info "Choose authentication method:"
-    echo "1) OAuth U2M (Recommended)"
-    echo "2) Personal Access Token (PAT)"
-    echo "3) Service Principal"
-    
-    local auth_method
-    read -p "Select authentication method [1]: " auth_method
-    auth_method=${auth_method:-1}
-    
-    case $auth_method in
-        1)
-            print_info "Configuring OAuth authentication..."
-            databricks configure --host "$workspace_url"
-            ;;
-        2)
-            print_info "Configuring PAT authentication..."
-            local token
-            read -s -p "Enter your Personal Access Token: " token
-            echo ""
-            databricks configure --token --host "$workspace_url" --token "$token"
-            ;;
-        3)
-            print_info "Configuring Service Principal authentication..."
-            local client_id client_secret
-            read -p "Enter Service Principal Client ID: " client_id
-            read -s -p "Enter Service Principal Client Secret: " client_secret
-            echo ""
-            databricks configure --host "$workspace_url" --client-id "$client_id" --client-secret "$client_secret"
-            ;;
-        *)
-            print_error "Invalid selection"
-            return 1
-            ;;
-    esac
-    
-    print_success "Authentication configured successfully!"
-}
-
-# Create project structure
-create_project() {
-    print_info "Creating Databricks Asset Bundle project..."
-    
-    # Get project details
-    local project_name=$(read_with_default "Enter project name" "my-databricks-project")
-    local project_dir=$(read_with_default "Enter project directory" "./$project_name")
-    
-    # Check if directory exists
-    if [ -d "$project_dir" ]; then
-        print_error "Directory $project_dir already exists!"
-        local overwrite
-        read -p "Overwrite existing directory? (y/n) [n]: " overwrite
-        overwrite=${overwrite:-n}
-        
-        if [[ ! "$overwrite" =~ ^[Yy]$ ]]; then
-            print_info "Exiting without creating project"
-            exit 0
-        fi
-        rm -rf "$project_dir"
+    else
+        print_error "No Databricks configuration found. Run 'databricks-workspace-setup.sh' first"
+        exit 1
     fi
     
-    # Create project directory
-    mkdir -p "$project_dir"
-    cd "$project_dir"
-    
-    # Initialize git repository
-    git init
-    
-    # Choose bundle template
-    echo ""
-    print_info "Available bundle templates:"
-    echo "1) default-python - Basic Python project"
-    echo "2) default-sql - SQL-based project"
-    echo "3) dbt-sql - DBT SQL project"
-    echo "4) mlops-stacks - MLOps project"
-    
-    local template_choice
-    read -p "Select template [1]: " template_choice
-    template_choice=${template_choice:-1}
-    
-    local template
-    case $template_choice in
-        1) template="default-python" ;;
-        2) template="default-sql" ;;
-        3) template="dbt-sql" ;;
-        4) template="mlops-stacks" ;;
-        *) template="default-python" ;;
-    esac
-    
-    print_info "Initializing bundle with template: $template"
-    
-    # Initialize bundle
-    databricks bundle init "$template" --output-dir .
-    
-    print_success "Project structure created!"
+    print_success "Prerequisites met"
 }
 
-# Configure bidirectional sync
-configure_sync() {
-    print_info "Configuring bidirectional sync..."
+# Create project
+create_project() {
+    print_info "Creating Databricks bundle project..."
     
-    # Update databricks.yml for Unity Catalog configuration
+    read -p "Project name [my-databricks-project]: " project_name
+    project_name=${project_name:-my-databricks-project}
+    
+    if [ -d "$project_name" ]; then
+        print_error "Directory $project_name already exists"
+        exit 1
+    fi
+    
+    mkdir -p "$project_name"
+    cd "$project_name"
+    
+    # Initialize bundle with profile
+    if [ -n "$DATABRICKS_CONFIG_PROFILE" ]; then
+        DATABRICKS_CONFIG_PROFILE="$DATABRICKS_CONFIG_PROFILE" databricks bundle init default-python --output-dir .
+    else
+        databricks bundle init default-python --output-dir .
+    fi
+    
+    # Update databricks.yml with multiple environments
+    update_bundle_config
+    
+    print_success "Project created"
+}
+
+# Update bundle configuration for multiple environments
+update_bundle_config() {
     if [ -f "databricks.yml" ]; then
-        # Add Unity Catalog configuration to existing content
-        cat >> databricks.yml << 'EOF'
+        # Add deployment targets matching profiles (dit/fit/iat)
+        cat >> databricks.yml << EOF
 
-# Unity Catalog configuration
-variables:
-  catalog:
-    description: Unity Catalog to use
-    default: main
-  schema:
-    description: Schema within the catalog
-    default: default
-  volume:
-    description: Volume for file storage
-    default: bundle_files
-
-# Workspace configuration with Unity Catalog paths
-workspace:
-  file_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
-
-# Ensure Unity Catalog is used for all operations
-bundle:
-  databricks_cli_version: ">=0.218.0"
-  
-# Add environment-specific Unity Catalog settings in targets
+# Deployment targets
 targets:
-  dev:
-    variables:
-      catalog: ${var.catalog}
-      schema: ${var.schema}_dev
-      volume: ${var.volume}_dev
-    
-  staging:
-    variables:
-      catalog: ${var.catalog}
-      schema: ${var.schema}_staging
-      volume: ${var.volume}_staging
-    
-  prod:
-    variables:
-      catalog: ${var.catalog}
-      schema: ${var.schema}
-      volume: ${var.volume}
+  dit:
+    mode: development
+    # Uses dit profile
+  
+  fit:
+    mode: development
+    # Uses fit profile
+  
+  iat:
+    mode: production
+    # Uses iat profile
 EOF
     fi
 }
 
-# Create VS Code configuration
+# Configure VS Code
 configure_vscode() {
-    print_info "Creating VS Code configuration..."
+    print_info "Configuring VS Code..."
     
-    # Create .vscode directory
     mkdir -p .vscode
     
-    # Create settings.json with Databricks extension optimizations
     cat > .vscode/settings.json << 'EOF'
 {
     "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-    "python.terminal.activateEnvironment": true,
-    "python.linting.enabled": true,
-    "python.linting.pylintEnabled": true,
-    "python.formatting.provider": "black",
-    "python.formatting.blackArgs": ["--line-length", "100"],
-    "editor.formatOnSave": true,
-    "files.exclude": {
-        "**/__pycache__": true,
-        "**/*.pyc": true,
-        ".coverage": true,
-        ".pytest_cache": true
-    },
-    "databricks.python.envFile": "${workspaceFolder}/.env",
-    "databricks.experiments.optInto": ["databricks.sdk"],
+    "python.pythonPath": "${workspaceFolder}/.venv/bin/python",
     "databricks.sync.destinationType": "workspace",
     "databricks.sync.remoteWatchEnabled": true,
-    "[python]": {
-        "editor.codeActionsOnSave": {
-            "source.organizeImports": true
-        }
-    },
-    "jupyter.notebookFileRoot": "${workspaceFolder}",
-    "terminal.integrated.env.linux": {
-        "DATABRICKS_CONFIG_FILE": "${workspaceFolder}/.databrickscfg"
-    },
-    "terminal.integrated.env.osx": {
-        "DATABRICKS_CONFIG_FILE": "${workspaceFolder}/.databrickscfg"
-    },
-    "terminal.integrated.env.windows": {
-        "DATABRICKS_CONFIG_FILE": "${workspaceFolder}\\.databrickscfg"
-    }
+    "python.testing.pytestEnabled": true,
+    "python.testing.pytestArgs": ["tests/"]
 }
 EOF
     
-    # Create launch.json for debugging with Databricks Connect
-    cat > .vscode/launch.json << 'EOF'
-{
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Python: Current File (Databricks Connect)",
-            "type": "databricks",
-            "request": "launch",
-            "program": "${file}",
-            "args": [],
-            "env": {}
-        },
-        {
-            "name": "Python: Debug Tests (pytest on Databricks)",
-            "type": "databricks",
-            "request": "launch",
-            "program": "${workspaceFolder}/pytest_databricks.py",
-            "args": ["tests/"],
-            "env": {}
-        },
-        {
-            "name": "Python: Debug Notebook",
-            "type": "python",
-            "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal",
-            "env": {
-                "PYTHONPATH": "${workspaceFolder}/src"
-            },
-            "justMyCode": false
-        },
-        {
-            "name": "Python: Debug Tests (Local)",
-            "type": "python",
-            "request": "launch",
-            "module": "pytest",
-            "args": [
-                "-v",
-                "--tb=short",
-                "tests/"
-            ],
-            "console": "integratedTerminal",
-            "justMyCode": false
-        }
-    ]
-}
-EOF
-    
-    # Create tasks.json with VS Code extension specific tasks
-    cat > .vscode/tasks.json << 'EOF'
-{
-    "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "Bundle: Validate",
-            "type": "shell",
-            "command": "databricks bundle validate",
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Bundle: Deploy (Dev)",
-            "type": "shell",
-            "command": "databricks bundle deploy -t dev",
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Bundle: Run Job",
-            "type": "shell",
-            "command": "databricks bundle run ${input:jobName} -t dev",
-            "group": "test",
-            "problemMatcher": []
-        },
-        {
-            "label": "Bundle: Sync (Watch Mode)",
-            "type": "shell",
-            "command": "databricks bundle sync -t dev --watch",
-            "isBackground": true,
-            "problemMatcher": [],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            }
-        },
-        {
-            "label": "Bundle: Destroy (Dev)",
-            "type": "shell",
-            "command": "databricks bundle destroy -t dev",
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Databricks: Install Connect",
-            "type": "shell",
-            "command": "pip install -U databricks-connect==$(databricks clusters get --cluster-id ${input:clusterId} | jq -r .spark_version | cut -d. -f1,2)",
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "Unity Catalog: Setup Resources",
-            "type": "shell",
-            "command": "./unity-catalog-setup.sh ${input:target}",
-            "group": "build",
-            "problemMatcher": []
-        }
-    ],
-    "inputs": [
-        {
-            "id": "jobName",
-            "description": "Job name to run",
-            "type": "promptString"
-        },
-        {
-            "id": "clusterId",
-            "description": "Cluster ID for Databricks Connect",
-            "type": "promptString"
-        },
-        {
-            "id": "target",
-            "description": "Deployment target",
-            "type": "pickString",
-            "options": ["dev", "staging", "prod"],
-            "default": "dev"
-        }
-    ]
-}
-EOF
-    
-    # Create extensions.json
     cat > .vscode/extensions.json << 'EOF'
 {
     "recommendations": [
         "databricks.databricks",
         "ms-python.python",
-        "ms-python.vscode-pylance",
-        "ms-python.black-formatter",
-        "ms-toolsai.jupyter",
-        "redhat.vscode-yaml"
+        "ms-toolsai.jupyter"
     ]
 }
 EOF
     
-    print_success "VS Code configuration created!"
+    print_success "VS Code configured"
 }
 
-# Create sync scripts
-create_sync_scripts() {
-    print_info "Creating sync scripts..."
-    
-    # Create sync start script
-    cat > start-sync.sh << 'EOF'
-#!/bin/bash
-# Start bidirectional sync with Databricks workspace
-
-echo "Starting Databricks sync in watch mode..."
-echo "Press Ctrl+C to stop sync"
-
-# Get the target from command line or use dev as default
-TARGET=${1:-dev}
-
-# Start sync with watch mode
-databricks bundle sync -t $TARGET --watch --interval 2s
-EOF
-    
-    chmod +x start-sync.sh
-    
-    # Create deployment script
-    cat > deploy.sh << 'EOF'
-#!/bin/bash
-# Deploy bundle to Databricks workspace
-
-set -e
-
-# Get the target from command line or use dev as default
-TARGET=${1:-dev}
-
-echo "Validating bundle..."
-databricks bundle validate -t $TARGET
-
-echo "Deploying bundle to target: $TARGET"
-databricks bundle deploy -t $TARGET
-
-echo "Deployment complete!"
-
-# Ask if user wants to start sync
-read -p "Start continuous sync? (y/n) [y]: " start_sync
-start_sync=${start_sync:-y}
-
-if [[ "$start_sync" =~ ^[Yy]$ ]]; then
-    ./start-sync.sh $TARGET
-fi
-EOF
-    
-    chmod +x deploy.sh
-    
-    # Create run script
-    cat > run-job.sh << 'EOF'
-#!/bin/bash
-# Run a job in the Databricks workspace
-
-set -e
-
-# Get the job name and target
-JOB_NAME=${1:-}
-TARGET=${2:-dev}
-
-if [ -z "$JOB_NAME" ]; then
-    echo "Usage: ./run-job.sh <job_name> [target]"
-    echo "Available jobs:"
-    databricks bundle validate -t $TARGET 2>/dev/null | grep -A 100 "jobs:" | grep -E "^\s+[a-zA-Z0-9_-]+:" | sed 's/://g' | xargs
-    exit 1
-fi
-
-echo "Running job: $JOB_NAME on target: $TARGET"
-databricks bundle run $JOB_NAME -t $TARGET
-EOF
-    
-    chmod +x run-job.sh
-    
-    print_success "Sync scripts created!"
-}
-
-# Create Python virtual environment
+# Create virtual environment
 create_virtualenv() {
     print_info "Creating Python virtual environment..."
     
-    python3 -m venv .venv
+    python3.11 -m venv .venv
+    source .venv/bin/activate
     
-    # Create activation script
+    pip install --upgrade pip
+    pip install databricks-sdk pytest
+    
     cat > activate.sh << 'EOF'
 #!/bin/bash
-# Activate the Python virtual environment
-
-if [ -f ".venv/bin/activate" ]; then
-    source .venv/bin/activate
-    echo "Virtual environment activated!"
-    echo "Python: $(which python)"
-    echo "Pip: $(which pip)"
-else
-    echo "Virtual environment not found. Run 'python3 -m venv .venv' first."
-    exit 1
-fi
+source .venv/bin/activate
+echo "Virtual environment activated"
 EOF
-    
     chmod +x activate.sh
     
-    # Install common dependencies including Databricks Connect support
-    source .venv/bin/activate
-    pip install --upgrade pip
-    
-    # Core dependencies
-    pip install databricks-sdk pyspark pytest pytest-cov black pylint ipykernel requests
-    
-    # Databricks Connect will be installed via VS Code extension
-    # Additional dependencies for notebook support
-    pip install 'databricks-sdk[notebook]' nbformat ipython
-    
-    # Create requirements files
-    pip freeze > requirements.txt
-    
-    # Create requirements-dev.txt
-    cat > requirements-dev.txt << 'EOF'
-pytest>=7.0.0
-pytest-cov>=4.0.0
-black>=23.0.0
-pylint>=2.0.0
-mypy>=1.0.0
-isort>=5.0.0
-flake8>=6.0.0
-pre-commit>=3.0.0
-EOF
-    
-    print_success "Virtual environment created!"
+    print_success "Virtual environment created"
 }
 
-# Create example notebooks and code
+# Create example notebook
 create_examples() {
-    print_info "Creating example code and notebooks..."
+    print_info "Creating example notebook..."
     
-    # Ensure src directory exists
-    mkdir -p src
-    
-    # Create example Python module with Databricks Connect support
-    cat > src/data_processing.py << 'EOF'
-"""Example data processing module for Databricks with Unity Catalog."""
-
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, count, avg, max, min
-from typing import Optional
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-
-def get_spark_session(app_name: str = "DataProcessing") -> SparkSession:
-    """Get or create a Spark session with Unity Catalog enabled.
-    
-    This will use Databricks Connect if available, otherwise local Spark.
-    
-    Args:
-        app_name: Name of the Spark application
-        
-    Returns:
-        SparkSession instance
-    """
-    try:
-        # Try Databricks Connect first
-        from databricks.connect import DatabricksSession
-        return DatabricksSession.builder.appName(app_name).getOrCreate()
-    except ImportError:
-        # Fall back to regular Spark session
-        return (SparkSession.builder
-                .appName(app_name)
-                .config("spark.sql.catalog.main", "unity")
-                .config("spark.databricks.unityCatalog.enabled", "true")
-                .getOrCreate())
-
-
-def process_data_from_volume(catalog: str, schema: str, volume: str,
-                           input_file: str, output_table: str,
-                           partition_cols: Optional[list] = None) -> None:
-    """Process data from Unity Catalog volume and save as managed table.
-    
-    Args:
-        catalog: Unity Catalog name
-        schema: Schema name
-        volume: Volume name
-        input_file: Input file name in volume
-        output_table: Output table name
-        partition_cols: Optional columns to partition by
-    """
-    spark = get_spark_session()
-    
-    # Construct volume path
-    volume_path = f"/Volumes/{catalog}/{schema}/{volume}/{input_file}"
-    
-    logger.info(f"Reading data from volume: {volume_path}")
-    
-    # Read data from volume
-    df = spark.read.format("parquet").load(volume_path)
-    
-    logger.info(f"Original data count: {df.count()}")
-    
-    # Example transformations
-    processed_df = df.filter(col("value").isNotNull())
-    
-    # Add aggregations
-    stats_df = processed_df.groupBy("category").agg(
-        count("*").alias("count"),
-        avg("value").alias("avg_value"),
-        max("value").alias("max_value"),
-        min("value").alias("min_value")
-    )
-    
-    logger.info(f"Processed data count: {processed_df.count()}")
-    
-    # Save as managed table in Unity Catalog
-    table_name = f"{catalog}.{schema}.{output_table}"
-    
-    write_df = processed_df.write.mode("overwrite")
-    
-    if partition_cols:
-        write_df = write_df.partitionBy(partition_cols)
-    
-    write_df.saveAsTable(table_name)
-    logger.info(f"Data saved to table: {table_name}")
-    
-    # Also save stats
-    stats_table = f"{catalog}.{schema}.{output_table}_stats"
-    stats_df.write.mode("overwrite").saveAsTable(stats_table)
-    logger.info(f"Stats saved to table: {stats_table}")
-
-
-def upload_file_to_volume(local_path: str, catalog: str, schema: str, 
-                         volume: str, target_path: str) -> None:
-    """Upload a local file to Unity Catalog volume.
-    
-    Args:
-        local_path: Path to local file
-        catalog: Unity Catalog name
-        schema: Schema name
-        volume: Volume name
-        target_path: Target path in volume
-    """
-    volume_path = f"/Volumes/{catalog}/{schema}/{volume}/{target_path}"
-    
-    # Get dbutils (available in notebooks and Databricks Connect)
-    try:
-        from databricks.sdk.dbutils import dbutils
-    except ImportError:
-        from pyspark.dbutils import DBUtils
-        spark = get_spark_session()
-        dbutils = DBUtils(spark)
-    
-    logger.info(f"Uploading {local_path} to {volume_path}")
-    dbutils.fs.cp(f"file:{local_path}", volume_path)
-    logger.info("Upload complete")
-
-
-if __name__ == "__main__":
-    # Example usage with Unity Catalog
-    process_data_from_volume(
-        catalog="main",
-        schema="default",
-        volume="my_data_volume",
-        input_file="raw_data.parquet",
-        output_table="processed_data",
-        partition_cols=["year", "month"]
-    )
-EOF
-    
-    # Create example Jupyter notebook (.ipynb format)
-    cat > notebooks/example_jupyter.ipynb << 'EOF'
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "# Jupyter Notebook Example for Databricks\n",
-    "This notebook demonstrates Jupyter format with Databricks Connect support"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Import required libraries\n",
-    "from pyspark.sql import SparkSession\n",
-    "from pyspark.sql.functions import *\n",
-    "import pandas as pd\n",
-    "import matplotlib.pyplot as plt\n",
-    "\n",
-    "# Spark session is automatically available as 'spark' global\n",
-    "print(f\"Spark version: {spark.version}\")"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## Create Sample Data"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Create sample DataFrame\n",
-    "data = [\n",
-    "    (\"Alice\", \"Engineering\", 75000),\n",
-    "    (\"Bob\", \"Engineering\", 80000),\n",
-    "    (\"Charlie\", \"Sales\", 65000),\n",
-    "    (\"Diana\", \"Sales\", 70000),\n",
-    "    (\"Eve\", \"HR\", 60000)\n",
-    "]\n",
-    "\n",
-    "df = spark.createDataFrame(data, [\"name\", \"department\", \"salary\"])\n",
-    "df.show()"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## Use dbutils for file operations"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# List files in volume\n",
-    "# Note: dbutils is automatically available in notebooks\n",
-    "files = dbutils.fs.ls(\"/Volumes/main/default/\")\n",
-    "for file in files[:5]:  # Show first 5\n",
-    "    print(f\"{file.name} - {file.size} bytes\")"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## Aggregations and Visualizations"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Department statistics\n",
-    "dept_stats = df.groupBy(\"department\").agg(\n",
-    "    count(\"*\").alias(\"count\"),\n",
-    "    avg(\"salary\").alias(\"avg_salary\"),\n",
-    "    max(\"salary\").alias(\"max_salary\")\n",
-    ")\n",
-    "\n",
-    "# Convert to Pandas for visualization\n",
-    "dept_stats_pd = dept_stats.toPandas()\n",
-    "display(dept_stats_pd)"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Create visualization\n",
-    "plt.figure(figsize=(10, 6))\n",
-    "plt.bar(dept_stats_pd[\"department\"], dept_stats_pd[\"avg_salary\"])\n",
-    "plt.xlabel(\"Department\")\n",
-    "plt.ylabel(\"Average Salary\")\n",
-    "plt.title(\"Average Salary by Department\")\n",
-    "plt.xticks(rotation=45)\n",
-    "plt.tight_layout()\n",
-    "plt.show()"
-   ]
-  },
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "## SQL Queries"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "# Register temp view\n",
-    "df.createOrReplaceTempView(\"employees\")\n",
-    "\n",
-    "# Run SQL query using sql() function\n",
-    "result = sql(\"\"\"\n",
-    "    SELECT department, \n",
-    "           COUNT(*) as employee_count,\n",
-    "           SUM(salary) as total_salary\n",
-    "    FROM employees\n",
-    "    GROUP BY department\n",
-    "    ORDER BY total_salary DESC\n",
-    "\"\"\")\n",
-    "\n",
-    "display(result)"
-   ]
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "Python 3",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.10.0"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 4
-}
-EOF
-    
-    # Create helper functions notebook
-    cat > notebooks/helper_functions.py << 'EOF'
+    mkdir -p notebooks
+    cat > notebooks/example.py << 'EOF'
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Helper Functions
-# MAGIC This notebook contains reusable functions that can be imported with %run
+# MAGIC # Example Notebook
 
 # COMMAND ----------
-
-def create_sample_data(spark, num_records=1000):
-    """Create sample sales data for testing."""
-    from pyspark.sql.functions import rand, randn, expr
-    
-    categories = ["Electronics", "Clothing", "Food", "Books", "Sports"]
-    
-    df = (spark.range(num_records)
-          .select(
-              expr("id as transaction_id"),
-              expr(f"element_at(array({','.join([f'\"{c}\"' for c in categories])}), cast(rand() * {len(categories)} + 1 as int)) as category"),
-              (rand() * 1000).alias("value"),
-              expr("date_sub(current_date(), cast(rand() * 365 as int)) as date")
-          ))
-    
-    return df
-
-# COMMAND ----------
-
-def analyze_data(df):
-    """Perform basic analysis on the dataframe."""
-    print(f"Total records: {df.count()}")
-    print(f"Date range: {df.agg({'date': 'min'}).collect()[0][0]} to {df.agg({'date': 'max'}).collect()[0][0]}")
-    print("\nCategory distribution:")
-    df.groupBy("category").count().orderBy("count", ascending=False).show()
-
-# COMMAND ----------
-
-def save_to_unity_catalog(df, catalog, schema, table_name):
-    """Save DataFrame as managed table in Unity Catalog."""
-    full_table_name = f"{catalog}.{schema}.{table_name}"
-    df.write.mode("overwrite").saveAsTable(full_table_name)
-    print(f"Data saved to: {full_table_name}")
-    return full_table_name
-
-# COMMAND ----------
-
-print("Helper functions loaded successfully!")
-EOF
-    
-    print_success "Example code and notebooks created!"
-}
-# Databricks notebook source
-# MAGIC %md
-# MAGIC # Example Data Analysis with Unity Catalog
-# MAGIC This notebook demonstrates working with Unity Catalog volumes and tables in Databricks on AWS
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Setup and Configuration
-
-# COMMAND ----------
-
-import sys
-sys.path.append("../src")
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
-from data_processing import get_spark_session
-import matplotlib.pyplot as plt
-import seaborn as sns
 
-# Initialize Spark with Unity Catalog
-spark = get_spark_session("UnityDataAnalysis")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Working with Unity Catalog Volumes
-# MAGIC 
-# MAGIC Unity Catalog volumes provide governed access to non-tabular data
-
-# COMMAND ----------
-
-# Set up catalog and schema (adjust to your environment)
-CATALOG = "main"  # or your custom catalog
-SCHEMA = "default"  # or your schema
-VOLUME = "my_volume"  # your volume name
-
-# Display available catalogs
-display(spark.sql("SHOW CATALOGS"))
-
-# COMMAND ----------
-
-# Show schemas in catalog
-spark.sql(f"USE CATALOG {CATALOG}")
-display(spark.sql("SHOW SCHEMAS"))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Upload Files to Volume
-
-# COMMAND ----------
-
-# Example: Upload a CSV file to volume
-# Note: In production, use the Databricks UI or REST API for file uploads
-
-# For small files, you can write directly to volumes
-sample_data = spark.createDataFrame([
-    ("Product A", "Electronics", 100, "2024-01-01"),
-    ("Product B", "Electronics", 150, "2024-01-02"),
-    ("Product C", "Clothing", 50, "2024-01-01"),
-    ("Product D", "Clothing", 75, "2024-01-02"),
-    ("Product E", "Food", 25, "2024-01-01"),
-], ["product", "category", "value", "date"])
-
-# Save to volume as CSV
-volume_path = f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/sample_data.csv"
-sample_data.write.mode("overwrite").option("header", "true").csv(volume_path)
-
-print(f"Data written to: {volume_path}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## List Files in Volume
-
-# COMMAND ----------
-
-# List files in volume
-files = dbutils.fs.ls(f"/Volumes/{CATALOG}/{SCHEMA}/{VOLUME}/")
-for file in files:
-    print(f"{file.name} - {file.size} bytes")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Read Data from Volume
-
-# COMMAND ----------
-
-# Read CSV from volume
-df = spark.read.option("header", "true").csv(volume_path)
-df = df.withColumn("value", col("value").cast("int"))
-df = df.withColumn("date", col("date").cast("date"))
-
+# Create sample data
+data = [("Alice", 25), ("Bob", 30), ("Charlie", 35)]
+df = spark.createDataFrame(data, ["name", "age"])
 display(df)
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## Create Managed Table in Unity Catalog
-
-# COMMAND ----------
-
-# Create a managed table from the dataframe
-table_name = f"{CATALOG}.{SCHEMA}.product_sales"
-
-df.write.mode("overwrite").saveAsTable(table_name)
-print(f"Table created: {table_name}")
-
-# Verify table creation
-display(spark.sql(f"DESCRIBE TABLE {table_name}"))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Data Analysis with Unity Catalog Tables
-
-# COMMAND ----------
-
-# Query the table
-sales_df = spark.table(table_name)
-
-# Perform aggregations
-category_stats = sales_df.groupBy("category").agg(
-    count("*").alias("count"),
-    sum("value").alias("total_value"),
-    avg("value").alias("avg_value"),
-    max("value").alias("max_value"),
-    min("value").alias("min_value")
-)
-
-display(category_stats)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Create Views for Data Access
-
-# COMMAND ----------
-
-# Create a view for easy access
-view_name = f"{CATALOG}.{SCHEMA}.category_summary"
-
-category_stats.createOrReplaceTempView("temp_category_summary")
-spark.sql(f"""
-    CREATE OR REPLACE VIEW {view_name} AS 
-    SELECT * FROM temp_category_summary
-""")
-
-print(f"View created: {view_name}")
-
-# Query the view
-display(spark.sql(f"SELECT * FROM {view_name}"))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Visualizations
-
-# COMMAND ----------
-
-# Convert to Pandas for visualization
-category_stats_pd = category_stats.toPandas()
-
-# Create visualizations
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-
-# Bar chart for total value
-ax1.bar(category_stats_pd["category"], category_stats_pd["total_value"])
-ax1.set_xlabel("Category")
-ax1.set_ylabel("Total Value")
-ax1.set_title("Total Value by Category")
-ax1.tick_params(axis='x', rotation=45)
-
-# Bar chart for count
-ax2.bar(category_stats_pd["category"], category_stats_pd["count"])
-ax2.set_xlabel("Category")
-ax2.set_ylabel("Count")
-ax2.set_title("Product Count by Category")
-ax2.tick_params(axis='x', rotation=45)
-
-plt.tight_layout()
-plt.show()
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Working with Delta Tables
-
-# COMMAND ----------
-
-# Convert to Delta format for better performance
-delta_table_name = f"{CATALOG}.{SCHEMA}.product_sales_delta"
-
-# Create Delta table
-sales_df.write.mode("overwrite").format("delta").saveAsTable(delta_table_name)
-print(f"Delta table created: {delta_table_name}")
-
-# Show table history
-display(spark.sql(f"DESCRIBE HISTORY {delta_table_name}"))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Grant Permissions (Unity Catalog Governance)
-
-# COMMAND ----------
-
-# Example: Grant permissions on table (adjust group names as needed)
-# Note: Requires appropriate privileges
-
-# spark.sql(f"GRANT SELECT ON TABLE {table_name} TO `data-scientists`")
-# spark.sql(f"GRANT MODIFY ON TABLE {table_name} TO `data-engineers`")
-# spark.sql(f"GRANT ALL PRIVILEGES ON SCHEMA {CATALOG}.{SCHEMA} TO `admins`")
-
-# Show current grants
-# display(spark.sql(f"SHOW GRANTS ON TABLE {table_name}"))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Clean Up (Optional)
-
-# COMMAND ----------
-
-# Drop objects if needed (be careful in production!)
-# spark.sql(f"DROP TABLE IF EXISTS {table_name}")
-# spark.sql(f"DROP VIEW IF EXISTS {view_name}")
-# spark.sql(f"DROP TABLE IF EXISTS {delta_table_name}")
-# dbutils.fs.rm(volume_path, True)
+# Basic transformations
+result = df.filter(col("age") > 25).select("name")
+display(result)
 EOF
     
-    # Create test file
-    mkdir -p tests
-    cat > tests/test_data_processing.py << 'EOF'
-"""Tests for data processing module."""
+    print_success "Example notebook created"
+}
 
+# Create deployment scripts
+create_scripts() {
+    print_info "Creating deployment scripts..."
+    
+    cat > deploy.sh << 'EOF'
+#!/bin/bash
+TARGET=${1:-dit}
+PROFILE=${2:-$TARGET}
+
+if [ -n "$PROFILE" ]; then
+    export DATABRICKS_CONFIG_PROFILE="$PROFILE"
+fi
+
+echo "Deploying to $TARGET using profile $PROFILE..."
+databricks bundle validate -t $TARGET
+databricks bundle deploy -t $TARGET
+echo "Deployment complete"
+EOF
+    chmod +x deploy.sh
+    
+    cat > sync.sh << 'EOF'
+#!/bin/bash
+TARGET=${1:-dit}
+PROFILE=${2:-$TARGET}
+
+if [ -n "$PROFILE" ]; then
+    export DATABRICKS_CONFIG_PROFILE="$PROFILE"
+fi
+
+echo "Starting sync to $TARGET using profile $PROFILE..."
+databricks bundle sync -t $TARGET --watch
+EOF
+    chmod +x sync.sh
+    
+    # Create profile-specific scripts
+    cat > deploy-with-profile.sh << 'EOF'
+#!/bin/bash
+echo "Available environments: dit, fit, iat"
+read -p "Select environment: " TARGET
+read -p "Use specific profile (leave empty to match target): " PROFILE
+
+if [ -z "$PROFILE" ]; then
+    PROFILE="$TARGET"
+fi
+
+./deploy.sh "$TARGET" "$PROFILE"
+EOF
+    chmod +x deploy-with-profile.sh
+    
+    print_success "Scripts created"
+}
+
+# Create basic tests
+create_tests() {
+    print_info "Creating test structure..."
+    
+    mkdir -p tests
+    cat > tests/test_example.py << 'EOF'
 import pytest
 from pyspark.sql import SparkSession
-from src.data_processing import get_spark_session, process_data_from_volume
-import tempfile
-import shutil
-from unittest.mock import MagicMock, patch
-
 
 @pytest.fixture(scope="session")
 def spark():
-    """Create a Spark session for testing."""
-    spark = SparkSession.builder \
-        .appName("TestDataProcessing") \
-        .master("local[*]") \
-        .config("spark.sql.shuffle.partitions", "1") \
-        .getOrCreate()
-    yield spark
-    spark.stop()
+    return SparkSession.builder.appName("test").master("local[*]").getOrCreate()
 
-
-def test_get_spark_session():
-    """Test Spark session creation with Unity Catalog config."""
-    spark = get_spark_session("TestApp")
-    assert spark is not None
-    assert spark.sparkContext.appName == "TestApp"
-    # Verify Unity Catalog config
-    assert spark.conf.get("spark.databricks.unityCatalog.enabled") == "true"
-
-
-@patch('src.data_processing.DBUtils')
-def test_process_data_from_volume(mock_dbutils, spark, tmp_path):
-    """Test data processing from Unity Catalog volume."""
-    # Create test data
-    data = [
-        ("A", "Cat1", 100),
-        ("B", "Cat1", 200),
-        ("C", "Cat2", 300),
-        ("D", "Cat2", None),
-    ]
-    columns = ["id", "category", "value"]
-    
-    test_df = spark.createDataFrame(data, columns)
-    
-    # Mock volume path
-    catalog = "test_catalog"
-    schema = "test_schema"
-    volume = "test_volume"
-    input_file = "test_data.parquet"
-    
-    # Save test data to temp location
-    temp_file = str(tmp_path / input_file)
-    test_df.write.parquet(temp_file)
-    
-    # Mock the volume read to return our test data
-    with patch('pyspark.sql.SparkSession.read') as mock_read:
-        mock_read.format.return_value.load.return_value = test_df
-        
-        # Test processing (this would normally write to a table)
-        # For testing, we'll verify the logic without actual table writes
-        with patch.object(test_df, 'write') as mock_write:
-            process_data_from_volume(
-                catalog=catalog,
-                schema=schema,
-                volume=volume,
-                input_file=input_file,
-                output_table="test_output"
-            )
-            
-            # Verify write was called
-            assert mock_write.mode.called
-
-
-def test_unity_catalog_volume_paths():
-    """Test Unity Catalog volume path construction."""
-    catalog = "main"
-    schema = "default"
-    volume = "my_volume"
-    file = "data.csv"
-    
-    expected_path = f"/Volumes/{catalog}/{schema}/{volume}/{file}"
-    assert expected_path == "/Volumes/main/default/my_volume/data.csv"
+def test_basic_spark(spark):
+    data = [("test", 1)]
+    df = spark.createDataFrame(data, ["name", "value"])
+    assert df.count() == 1
 EOF
     
-    print_success "Example code and notebooks created!"
+    print_success "Tests created"
 }
 
-# Create documentation
-create_documentation() {
-    print_info "Creating documentation..."
-    
-    # Create README.md
-    cat > README.md << 'EOF'
-# Databricks Asset Bundle Project
-
-This project is configured with Databricks Asset Bundles for easy development and deployment.
-
-## Project Structure
-
-```
-.
-├── databricks.yml          # Bundle configuration
-├── .vscode/               # VS Code configuration
-├── src/                   # Python source code
-├── notebooks/             # Databricks notebooks
-├── tests/                 # Unit tests
-├── resources/             # Bundle resources (jobs, pipelines)
-├── .venv/                 # Python virtual environment
-├── requirements.txt       # Python dependencies
-├── start-sync.sh         # Start continuous sync
-├── deploy.sh             # Deploy bundle
-└── run-job.sh           # Run Databricks jobs
-```
-
-## Quick Start
-
-1. **Activate Python environment:**
-   ```bash
-   source activate.sh
-   ```
-
-2. **Deploy to Databricks:**
-   ```bash
-   ./deploy.sh dev
-   ```
-
-3. **Start continuous sync:**
-   ```bash
-   ./start-sync.sh dev
-   ```
-
-## Development Workflow
-
-### VS Code Integration
-
-1. Install recommended extensions when prompted
-2. The Databricks extension will automatically detect the project
-3. Use the Command Palette (Cmd/Ctrl+Shift+P) to access Databricks commands
-
-### Bidirectional Sync
-
-The project is configured for bidirectional sync between your local environment and Databricks:
-
-- **Automatic sync**: Files are automatically synced when saved
-- **Manual sync**: Run `./start-sync.sh` for continuous sync
-- **Watch mode**: Changes are detected and synced every 2 seconds
-
-### Running Jobs
-
-To run a job defined in your bundle:
-
-```bash
-./run-job.sh <job_name> [target]
-```
-
-Example:
-```bash
-./run-job.sh my_etl_job dev
-```
-
-### Testing
-
-Run tests locally:
-```bash
-pytest tests/
-```
-
-Run tests with coverage:
-```bash
-pytest tests/ --cov=src --cov-report=html
-```
-
-## Bundle Commands
-
-### Validate Configuration
-```bash
-databricks bundle validate -t dev
-```
-
-### Deploy Bundle
-```bash
-databricks bundle deploy -t dev
-```
-
-### Run Specific Job
-```bash
-databricks bundle run <job_name> -t dev
-```
-
-### Destroy Bundle
-```bash
-databricks bundle destroy -t dev
-```
-
-## Deployment Targets
-
-The project includes multiple deployment targets:
-
-- **dev**: Development environment (default)
-- **staging**: Staging environment
-- **prod**: Production environment
-
-To deploy to a specific target:
-```bash
-./deploy.sh <target>
-```
-
-## Best Practices
-
-1. **Version Control**: Commit all changes to git before deployment
-2. **Testing**: Run tests before deploying to staging/production
-3. **Code Review**: Use pull requests for production deployments
-4. **Secrets**: Never commit secrets; use Databricks secrets instead
-5. **Dependencies**: Keep requirements.txt updated
-
-## Troubleshooting
-
-### Sync Issues
-
-If files are not syncing:
-1. Check `.gitignore` and sync exclude patterns
-2. Ensure Databricks CLI is authenticated
-3. Verify workspace permissions
-
-### Authentication Issues
-
-Re-configure authentication:
-```bash
-databricks configure
-```
-
-### VS Code Extension Issues
-
-1. Reload VS Code window
-2. Check Databricks extension output panel
-3. Ensure you're in the correct project folder
-
-## Contributing
-
-1. Create a feature branch
-2. Make changes and test locally
-3. Deploy to dev environment
-4. Create pull request
-5. Deploy to staging after approval
-6. Deploy to production after staging validation
-
-## Resources
-
-- [Databricks Asset Bundles Documentation](https://docs.databricks.com/dev-tools/bundles/)
-- [Databricks CLI Documentation](https://docs.databricks.com/dev-tools/cli/)
-- [VS Code Extension Documentation](https://docs.databricks.com/dev-tools/vscode-ext/)
-- [Databricks on AWS Best Practices](https://docs.databricks.com/aws/index.html)
-- [Bitbucket Pipelines Documentation](https://support.atlassian.com/bitbucket-cloud/docs/get-started-with-bitbucket-pipelines/)
-EOF
-    
-    # Create .gitignore
-    cat > .gitignore << 'EOF'
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual Environment
-.venv/
-venv/
-ENV/
-env/
-
-# Testing
-.coverage
-.pytest_cache/
-htmlcov/
-.tox/
-.nox/
-
-# IDE
-.vscode/*
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
-.idea/
-*.swp
-*.swo
-*~
-
-# Databricks
-.databricks/
-*.dbc
-databricks.yml.backup
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Logs
-*.log
-logs/
-
-# Environment variables
-.env
-.env.local
-.databrickscfg
-
-# Temporary files
-tmp/
-temp/
-*.tmp
-EOF
-    
-    # Create pre-commit configuration
-    cat > .pre-commit-config.yaml << 'EOF'
-repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
-    hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
-      - id: check-yaml
-      - id: check-added-large-files
-      - id: check-json
-      - id: check-merge-conflict
-
-  - repo: https://github.com/psf/black
-    rev: 24.1.1
-    hooks:
-      - id: black
-        language_version: python3
-        args: [--line-length=100]
-
-  - repo: https://github.com/pycqa/isort
-    rev: 5.13.2
-    hooks:
-      - id: isort
-        args: [--profile=black, --line-length=100]
-
-  - repo: https://github.com/pycqa/flake8
-    rev: 7.0.0
-    hooks:
-      - id: flake8
-        args: [--max-line-length=100, --ignore=E203,W503]
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.8.0
-    hooks:
-      - id: mypy
-        additional_dependencies: [types-requests]
-EOF
-    
-    print_success "Documentation created!"
-}
-
-# Create CI/CD templates
-create_cicd_templates() {
-    print_info "Creating CI/CD templates..."
-    
-    # Create Bitbucket Pipelines configuration
-    cat > bitbucket-pipelines.yml << 'EOF'
-# Bitbucket Pipelines configuration for Databricks Asset Bundles
-image: python:3.10
-
-definitions:
-  caches:
-    databricks-cli: ~/.local/bin
-    pip: ~/.cache/pip
-  
-  steps:
-    - step: &install-cli
-        name: Install Databricks CLI
-        caches:
-          - databricks-cli
-        script:
-          - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
-          - export PATH=$PATH:$HOME/.local/bin
-          - databricks version
-    
-    - step: &run-tests
-        name: Run Tests
-        caches:
-          - pip
-        script:
-          - pip install --upgrade pip
-          - pip install -r requirements.txt
-          - pip install -r requirements-dev.txt
-          - pytest tests/ --cov=src --cov-report=xml --cov-report=html
-        artifacts:
-          - coverage.xml
-          - htmlcov/**
-    
-    - step: &validate-bundle
-        name: Validate Bundle
-        caches:
-          - databricks-cli
-        script:
-          - export PATH=$PATH:$HOME/.local/bin
-          - databricks bundle validate -t dev
-
-pipelines:
-  default:
-    - step: *run-tests
-    - step: *install-cli
-    - step: *validate-bundle
-
-  branches:
-    develop:
-      - step: *run-tests
-      - step: *install-cli
-      - step: *validate-bundle
-      - step:
-          name: Deploy to Dev
-          deployment: dev
-          caches:
-            - databricks-cli
-          script:
-            - export PATH=$PATH:$HOME/.local/bin
-            - databricks bundle deploy -t dev --force
-    
-    main:
-      - step: *run-tests
-      - step: *install-cli
-      - step: *validate-bundle
-      - step:
-          name: Deploy to Staging
-          deployment: staging
-          caches:
-            - databricks-cli
-          script:
-            - export PATH=$PATH:$HOME/.local/bin
-            - databricks bundle deploy -t staging --force
-      - step:
-          name: Deploy to Production
-          deployment: production
-          trigger: manual
-          caches:
-            - databricks-cli
-          script:
-            - export PATH=$PATH:$HOME/.local/bin
-            - databricks bundle deploy -t prod --force
-
-  pull-requests:
-    '**':
-      - step: *run-tests
-      - step: *install-cli
-      - step: *validate-bundle
-      - step:
-          name: Bundle Dry Run
-          caches:
-            - databricks-cli
-          script:
-            - export PATH=$PATH:$HOME/.local/bin
-            - databricks bundle deploy -t dev --dry-run
-
-  custom:
-    rollback-prod:
-      - step:
-          name: Rollback Production
-          deployment: production
-          caches:
-            - databricks-cli
-          script:
-            - export PATH=$PATH:$HOME/.local/bin
-            - echo "Implement rollback logic here"
-            # Example: databricks bundle deploy -t prod --force --version previous
-EOF
-    
-    # Create AWS-specific buildspec.yml for AWS CodeBuild
-    cat > buildspec.yml << 'EOF'
-    # Create AWS-specific buildspec.yml for AWS CodeBuild
-    cat > buildspec.yml << 'EOF'
-# AWS CodeBuild specification for Databricks on AWS
-version: 0.2
-
-env:
-  variables:
-    PYTHON_VERSION: "3.10"
-  secrets-manager:
-    DATABRICKS_HOST: databricks-secrets:host
-    DATABRICKS_TOKEN: databricks-secrets:token
-
-phases:
-  install:
-    runtime-versions:
-      python: $PYTHON_VERSION
-    commands:
-      - echo "Installing Databricks CLI..."
-      - curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
-      - export PATH=$PATH:$HOME/.local/bin
-      - databricks version
-      
-  pre_build:
-    commands:
-      - echo "Installing Python dependencies..."
-      - pip install --upgrade pip
-      - pip install -r requirements.txt
-      - pip install -r requirements-dev.txt
-      - echo "Running tests..."
-      - pytest tests/ --cov=src --cov-report=xml --cov-report=html
-      
-  build:
-    commands:
-      - echo "Validating Databricks bundle..."
-      - export PATH=$PATH:$HOME/.local/bin
-      - databricks bundle validate -t $ENVIRONMENT
-      
-  post_build:
-    commands:
-      - echo "Deploying to Databricks on AWS..."
-      - export PATH=$PATH:$HOME/.local/bin
-      - |
-        if [ "$CODEBUILD_WEBHOOK_HEAD_REF" = "refs/heads/main" ]; then
-          databricks bundle deploy -t prod --force
-        elif [ "$CODEBUILD_WEBHOOK_HEAD_REF" = "refs/heads/develop" ]; then
-          databricks bundle deploy -t dev --force
-        else
-          echo "Branch not configured for deployment"
-        fi
-
-artifacts:
-  files:
-    - 'coverage.xml'
-    - 'htmlcov/**/*'
-  name: test-reports
-
-cache:
-  paths:
-    - '/root/.cache/pip/**/*'
-    - '/root/.local/bin/**/*'
-EOF
-    
-    # Create AWS CDK template for infrastructure
-    mkdir -p infrastructure
-    cat > infrastructure/databricks_cicd_stack.py << 'EOF'
-"""AWS CDK Stack for Databricks CI/CD Pipeline."""
-
-from aws_cdk import (
-    Stack,
-    aws_codebuild as codebuild,
-    aws_codecommit as codecommit,
-    aws_codepipeline as codepipeline,
-    aws_codepipeline_actions as codepipeline_actions,
-    aws_iam as iam,
-    aws_secretsmanager as secretsmanager,
-    aws_s3 as s3,
-)
-from constructs import Construct
-
-
-class DatabricksCICDStack(Stack):
-    """CDK Stack for Databricks Asset Bundle CI/CD."""
-
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
-        super().__init__(scope, construct_id, **kwargs)
-
-        # S3 bucket for artifacts
-        artifact_bucket = s3.Bucket(
-            self, "DatabricksArtifacts",
-            versioned=True,
-            encryption=s3.BucketEncryption.S3_MANAGED,
-        )
-
-        # Secrets for Databricks credentials
-        databricks_secret = secretsmanager.Secret(
-            self, "DatabricksCredentials",
-            description="Databricks host and token",
-            secret_object_value={
-                "host": secretsmanager.SecretValue.unsafe_plain_text("https://your-workspace.cloud.databricks.com"),
-                "token": secretsmanager.SecretValue.unsafe_plain_text("your-token-here"),
-            },
-        )
-
-        # CodeBuild project
-        build_project = codebuild.Project(
-            self, "DatabricksBundleBuild",
-            source=codebuild.Source.code_commit(
-                repository=codecommit.Repository.from_repository_name(
-                    self, "SourceRepo", "databricks-bundle-repo"
-                )
-            ),
-            environment=codebuild.BuildEnvironment(
-                build_image=codebuild.LinuxBuildImage.STANDARD_7_0,
-                compute_type=codebuild.ComputeType.SMALL,
-            ),
-            environment_variables={
-                "ENVIRONMENT": codebuild.BuildEnvironmentVariable(
-                    value="dev"
-                ),
-            },
-        )
-
-        # Grant access to secrets
-        databricks_secret.grant_read(build_project)
-
-        # Add CodePipeline for automation
-        pipeline = codepipeline.Pipeline(
-            self, "DatabricksPipeline",
-            artifact_bucket=artifact_bucket,
-        )
-
-        # Source stage
-        source_output = codepipeline.Artifact()
-        source_action = codepipeline_actions.CodeCommitSourceAction(
-            action_name="Source",
-            repository=codecommit.Repository.from_repository_name(
-                self, "PipelineRepo", "databricks-bundle-repo"
-            ),
-            output=source_output,
-            branch="main",
-        )
-
-        pipeline.add_stage(
-            stage_name="Source",
-            actions=[source_action],
-        )
-
-        # Build stage
-        build_action = codepipeline_actions.CodeBuildAction(
-            action_name="Build",
-            project=build_project,
-            input=source_output,
-            outputs=[codepipeline.Artifact()],
-        )
-
-        pipeline.add_stage(
-            stage_name="Build",
-            actions=[build_action],
-        )
-EOF
-    
-    print_success "CI/CD templates created!"
-}
-
-# Setup pre-commit hooks
-setup_precommit() {
-    print_info "Setting up pre-commit hooks..."
-    
-    source .venv/bin/activate
-    pip install pre-commit
-    pre-commit install
-    
-    print_success "Pre-commit hooks installed!"
-}
-
-# Final setup steps
-finalize_setup() {
-    print_info "Finalizing setup..."
-    
-    # Initialize git repository if not already initialized
-    if [ ! -d ".git" ]; then
-        git init
-    fi
-    
-    # Add all files to git
-    git add .
-    git commit -m "Initial Databricks Asset Bundle project setup" || true
-    
-    # Create a summary file
-    cat > SETUP_COMPLETE.md << EOF
-# Setup Complete! 🎉
-
-Your Databricks Asset Bundle project has been successfully created.
-
-## Project Details
-- **Project Directory**: $(pwd)
-- **Python Version**: $(python3 --version)
-- **Databricks CLI Version**: $(databricks version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "Unknown")
-
-## Next Steps
-
-1. **Activate Python Environment**:
-   \`\`\`bash
-   source activate.sh
-   \`\`\`
-
-2. **Configure VS Code**:
-   - Open this folder in VS Code
-   - Install recommended extensions when prompted
-   - The Databricks extension will auto-detect the project
-
-3. **Deploy to Databricks**:
-   \`\`\`bash
-   ./deploy.sh dev
-   \`\`\`
-
-4. **Start Continuous Sync**:
-   \`\`\`bash
-   ./start-sync.sh dev
-   \`\`\`
-
-## Quick Commands
-
-- **Validate bundle**: \`databricks bundle validate -t dev\`
-- **Deploy bundle**: \`./deploy.sh dev\`
-- **Start sync**: \`./start-sync.sh dev\`
-- **Run job**: \`./run-job.sh <job_name> dev\`
-- **Run tests**: \`pytest tests/\`
-
-## Important Files
-
-- \`databricks.yml\` - Main bundle configuration
-- \`.vscode/\` - VS Code settings and tasks
-- \`src/\` - Python source code
-- \`notebooks/\` - Databricks notebooks
-- \`tests/\` - Unit tests
-
-## Troubleshooting
-
-If you encounter issues:
-1. Check Databricks CLI authentication: \`databricks auth env\`
-2. Validate bundle configuration: \`databricks bundle validate\`
-3. Check VS Code Databricks extension output panel
-
-Happy coding! 🚀
-EOF
-    
-    print_success "Setup complete!"
-    
-    # Display summary
-    echo ""
-    echo "========================================"
-    echo "    Databricks Bundle Setup Complete!   "
-    echo "========================================"
-    echo ""
-    echo "Project created at: $(pwd)"
-    echo ""
-    echo "Next steps:"
-    echo "1. cd $(pwd)"
-    echo "2. source activate.sh"
-    echo "3. code .  # Open in VS Code"
-    echo "4. ./deploy.sh dev"
-    echo ""
-    echo "For more details, see SETUP_COMPLETE.md"
-}
-
-# Main execution flow
+# Main execution
 main() {
     echo "========================================"
-    echo "  Databricks Asset Bundle Setup Script  "
+    echo "  Databricks Bundle Project Setup"
     echo "========================================"
     echo ""
+    if [ -n "$DATABRICKS_CONFIG_PROFILE" ]; then
+        echo "Using profile: $DATABRICKS_CONFIG_PROFILE"
+    fi
+    echo ""
     
-    # Main execution flow
     check_prerequisites
-    configure_auth
     create_project
-    configure_sync
     configure_vscode
-    create_sync_scripts
     create_virtualenv
     create_examples
-    create_pytest_runner
-    create_documentation
-    create_cicd_templates
-    setup_precommit
-    finalize_setup
+    create_scripts
+    create_tests
+    
+    echo ""
+    print_success "Project setup complete!"
+    echo ""
+    echo "Next steps:"
+    echo "1. cd $(basename $(pwd))"
+    echo "2. source activate.sh"
+    echo "3. code . (open in VS Code)"
+    echo "4. ./deploy.sh dev"
+    echo "5. ./sync.sh dev"
 }
 
-# Run main function
 main "$@"
